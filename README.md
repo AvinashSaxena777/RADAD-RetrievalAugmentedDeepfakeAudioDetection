@@ -1,6 +1,20 @@
 # RADAD-RetrievalAugmentedDeepfakeAudioDetection
 Retrieval Augmented Framework for Deepfake Audio Detection
 
+This repository is for my ongoing research work as part of Master's program in Aritificial Intelligent at SJSU.
+
+Advisor: Prof. Kaikai Liu
+
+Author: Avinash Saxena
+
+---
+## Architecture Overview
+
+![alt text](resources/architecture.png)
+
+
+-----
+## Code setup and execution instructions
 
 1. Download and unzip the dataset
 ```
