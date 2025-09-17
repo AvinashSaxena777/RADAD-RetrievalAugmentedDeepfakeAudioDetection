@@ -7,3 +7,4 @@ scikit-learn
 faiss-cpu
 transformers
 librosa
+faiss-gpu-cu11==1.10.0

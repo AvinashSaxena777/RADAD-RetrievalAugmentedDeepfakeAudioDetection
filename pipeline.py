@@ -14,481 +14,567 @@ from projection import ProjectionLayer
 from detection_model import DetectionModel
 # from torch.utils.data import DataLoader
 
+import os
+import logging
+import numpy as np
+import torch
+from torch.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from typing import Optional, Tuple, List
+import torch.nn as nn
+
 class DeepfakeDetectionPipeline:
-    """Main pipeline for audio deepfake detection."""
+    """Main pipeline for audio deepfake detection with single-GPU optimizations."""
 
     def __init__(self, config: Config):
         self.config = config
+        self.device = config.device
 
-        # Initialize components
+        # 1. Audio segmenter (CPU)
         self.audio_segmenter = AudioSegmenter(config)
 
-        # Initialize feature extractor first
+        # 2. Feature extractor (kept on CPU internally, model lives on GPU)
         self.feature_extractor = Wav2Vec2FeatureExtractor(config)
 
-        # Set feature_dim in config based on actual loaded model
-        if not hasattr(config, 'feature_dim'):
+        # 3. Set feature_dim in config
+        if not hasattr(config, "feature_dim"):
             config.feature_dim = self.feature_extractor.feature_dim
             print(f"Feature dimension set to: {config.feature_dim}")
 
-        # Now initialize TPP with correct feature dimension
+        # 4. TPP and vector DB
         self.tpp = TemporalPyramidPooling(config)
         self.vector_db = VectorDatabase(config)
 
-        # Calculate output dimension of TPP
-        self.tpp_output_dim = self.tpp.get_output_dim()
+        # 5. Projection & detection (moved to GPU)
+        self.projection_layer = ProjectionLayer(config, self.tpp.get_output_dim()).to(self.device)
+        fuse_in_dim  = self.tpp.get_output_dim() + self.config.projection_output_dim
+        fuse_out_dim = self.config.projection_output_dim
+        self.fuse = nn.Linear(fuse_in_dim, fuse_out_dim).to(self.device)
+        self.detection_model  = DetectionModel(config, fuse_out_dim).to(self.device)
 
-        # Initialize model components
-        self.projection_layer = ProjectionLayer(config, self.tpp_output_dim)
-        self.detection_model = DetectionModel(config, config.projection_output_dim)
+        # 6. Optimizers & AMP scaler
+        self.projection_optimizer = torch.optim.Adam(self.projection_layer.parameters(),
+                                                     lr=config.learning_rate,
+                                                     weight_decay=config.weight_decay)
+        self.fuse_optimizer = torch.optim.Adam(self.fuse.parameters(),
+                                       lr=config.learning_rate,
+                                       weight_decay=config.weight_decay)
+        self.detection_optimizer  = torch.optim.Adam(self.detection_model.parameters(),
+                                                     lr=config.learning_rate,
+                                                     weight_decay=config.weight_decay)
 
-        # Move models to device
-        self.projection_layer.to(config.device)
-        self.detection_model.to(config.device)
+        self.scaler    = GradScaler("cuda")
 
-        # Set up optimizers
-        self.projection_optimizer = torch.optim.Adam(
-            self.projection_layer.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
+        # Track training file IDs for leakage checks
+        self.training_file_ids = set()
 
-        self.detection_optimizer = torch.optim.Adam(
-            self.detection_model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
 
-        # Set up loss function
-        self.criterion = torch.nn.BCEWithLogitsLoss()
+    def compute_pos_weight_from_dataset(self, dataset) -> float:
+        from torch.utils.data import DataLoader
+        import math, numpy as np, torch
 
-    def process_audio(self, audio_path: str) -> np.ndarray:
-        """Process a single audio file through the pipeline."""
-        # Load audio file
-        dataset = AudioDataset(self.config, is_train=False)
-        audio = dataset.load_audio(audio_path)
-
-        # Segment audio
-        audio_segments = self.audio_segmenter.segment_audio(audio)
-
-        # Extract features
-        feature_segments = self.feature_extractor.extract_features(audio_segments)
-
-        # Apply TPP to each feature segment
-        tpp_vectors = []
-        for features in feature_segments:
-            tpp_vector = self.tpp.pool_features(features)
-            tpp_vectors.append(tpp_vector.numpy())
-
-        # Average the TPP vectors across segments
-        if tpp_vectors:
-            tpp_vector = np.mean(tpp_vectors, axis=0)
-        else:
-            tpp_vector = np.zeros(self.tpp_output_dim)
-
-        return tpp_vector
-
-    def build_vector_database(self, dataset: AudioDataset):
-        """Build the vector database from training data."""
-        vectors = []
-        paths = []
-        labels = []
-        metadata = {'speaker_id': []}
-
-        for idx in tqdm(range(len(dataset)), desc="Building vector database"):
-            item = dataset[idx]
-            audio_path = item['path']
-            label = item['label']
-
-            # Get speaker ID if available
-            if 'metadata' in item and 'speaker_id' in item['metadata']:
-                speaker_id = item['metadata']['speaker_id']
+        loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0)
+        pos = 0
+        neg = 0
+        for b in loader:
+            y = b['label']
+            if isinstance(y, torch.Tensor):
+                y = y.float()
+                pos += (y > 0.5).sum().item()
+                neg += (y <= 0.5).sum().item()
             else:
-                speaker_id = "unknown"
+                y = torch.tensor(y, dtype=torch.float32)
+                pos += (y > 0.5).sum().item()
+                neg += (y <= 0.5).sum().item()
+        # Safe ratio
+        pos_weight = (neg + 1.0) / (pos + 1.0)  # +1 smoothing to avoid div-by-zero
+        if not np.isfinite(pos_weight):
+            pos_weight = 1.0
+        pos_weight = float(np.clip(pos_weight, 0.1, 10.0))  # clamp to reasonable range
+        return pos_weight
 
-            # Process audio
-            tpp_vector = self.process_audio(audio_path)
+    def process_audio_batch(self,
+                            audio_paths: List[str],
+                            audio_dataset: AudioDataset) -> torch.Tensor:
+        """
+        Batch-process audio files:
+          - Load & segment on CPU
+          - Extract features; move each tensor to GPU
+          - Pool with TPP on GPU
+        Returns a tensor of shape [batch_size, tpp_output_dim].
+        """
+        # 1. Load & segment
+        segments_batch = []
+        for path in audio_paths:
+            wav = audio_dataset.load_audio(path)
+            if wav is None:
+                raise RuntimeError(f"Failed to load '{path}'")
+            segments_batch.append(self.audio_segmenter.segment_audio(wav))
 
-            vectors.append(tpp_vector)
-            paths.append(audio_path)
-            labels.append(label)
-            metadata['speaker_id'].append(speaker_id)
+        # 2. Extract features and move to GPU
+        #    extract_features returns List[Tensor(cpu)] per audio file
+        feature_batches = []
+        for segments in segments_batch:
+            cpu_tensors = self.feature_extractor.extract_features(segments)
+            # move each to GPU and keep batch dimension
+            gpu_tensors = [t.to(self.device) for t in cpu_tensors]
+            feature_batches.append(gpu_tensors)
 
-        # Convert lists to arrays
+        # 3. Pool with TPP (GPU); compute one vector per audio file
+        pooled = []
+        for gpu_list in feature_batches:
+            # average TPP over all segments
+            seg_pooled = [self.tpp.pool_features(ft) for ft in gpu_list]  # each ft on GPU
+            mean_pooled = torch.mean(torch.stack(seg_pooled), dim=0)
+            pooled.append(mean_pooled)
+
+        return torch.stack(pooled)  # [batch, tpp_output_dim]
+
+
+    def build_vector_database(self, train_dataset: AudioDataset):
+        """Build the FAISS vector DB using batched GPU processing."""
+        logging.info("Building vector database from TRAINING data...")
+        loader = DataLoader(train_dataset,
+                            batch_size=self.config.db_batch_size,
+                            shuffle=False,
+                            pin_memory=True,
+                            num_workers=self.config.num_workers)
+
+        vectors, paths, labels, metadata = [], [], [], {'speaker_id': []}
+        self.training_file_ids.clear()
+        audio_ds = AudioDataset(self.config, is_train=False)
+
+        for batch in tqdm(loader, desc="Vector DB Build"):
+            audio_paths = batch['path']
+            batch_vecs = self.process_audio_batch(audio_paths, audio_ds).cpu().numpy()
+            for vec, path, lbl, meta in zip(batch_vecs,
+                                            audio_paths,
+                                            batch['label'],
+                                            batch['metadata']):
+                file_id = os.path.basename(path)
+                self.training_file_ids.add(file_id)
+                vectors.append(vec)
+                paths.append(path)
+                labels.append(lbl)
+                # metadata may be dict or string; handle both
+                if isinstance(meta, dict):
+                    speaker = meta.get('speaker_id', 'unknown')
+                else:
+                    speaker = meta
+                metadata['speaker_id'].append(speaker)
+
         vectors = np.vstack(vectors)
-
-        # Add vectors to database
         self.vector_db.add_vectors(vectors, paths, labels, metadata)
-
-        # Save the database
         self.vector_db.save()
+        logging.info(f"Built vector DB ({len(vectors)} samples)")
 
-    def retrieve_similar_vectors(self, query_vector: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Retrieve similar vectors from the database."""
-        # Search for similar vectors
-        distances, retrieved_labels = self.vector_db.search(query_vector)
 
-        # Convert to PyTorch tensors
-        distances_tensor = torch.tensor(distances, dtype=torch.float32, device=self.config.device)
-        labels_tensor = torch.tensor(retrieved_labels, dtype=torch.float32, device=self.config.device)
+    def retrieve_similar_vectors(self,query_vectors: torch.Tensor,
+    query_paths: Optional[List[str]] = None,   # helps exclude only the query file(s)
+    exclude_self: bool = True,
+    return_info: bool = False,                 # when True, return neighbor paths
+    return_distances: bool = False             # when True, return neighbor FAISS distances
+    ):
+      """
+      Batched retrieval from FAISS.
 
-        # Use distances to create embeddings tensor
-        # Here we're using a simple approach - in a real system you might want to
-        # retrieve the actual embeddings from a storage system
-        similar_vectors = []
-        for idx in range(len(distances)):
-            # Get the index from the search results
-            index = self.vector_db.index.reconstruct(idx)
-            similar_vectors.append(index)
+      Returns:
+          if return_info == False and return_distances == False:
+              (vec_tensor [B,K,D], lbl_tensor [B,K])
 
-        similar_vectors = torch.tensor(np.array(similar_vectors), dtype=torch.float32, device=self.config.device)
+          if return_info == True and return_distances == False:
+              (vec_tensor [B,K,D], lbl_tensor [B,K], neighbor_paths: List[List[str]])
 
-        return similar_vectors, labels_tensor
+          if return_info == False and return_distances == True:
+              (vec_tensor [B,K,D], lbl_tensor [B,K], dist_tensor [B,K])
 
-    # Training and evaluation methods continue...
-    def train(self, train_dataset: AudioDataset, val_dataset: Optional[AudioDataset] = None):
-      """Train the detection model."""
-      # Build vector database if not already built
-      if self.vector_db.index is None:
-          self.build_vector_database(train_dataset)
+          if both True:
+              (vec_tensor [B,K,D], lbl_tensor [B,K], neighbor_paths, dist_tensor [B,K])
+      """
+      import numpy as np, os
 
-      # Set models to training mode
-      self.projection_layer.train()
-      self.detection_model.train()
+      q_np = query_vectors.detach().cpu().numpy().astype(np.float32)  # [B, D]
+      B = q_np.shape[0]
+      K = int(self.config.top_k)
+      D = self.tpp.get_output_dim()
 
-      # Training loop
-      best_val_loss = float('inf')
-      patience_counter = 0
+      # Build exclusion set for exact files if provided
+      exclude_ids = set()
+      if exclude_self and query_paths is not None:
+          exclude_ids = {os.path.basename(p) for p in query_paths}
 
-      for epoch in range(self.config.num_epochs):
-          # Training phase
-          self.projection_layer.train()
-          self.detection_model.train()
+      # Empty-index fallback
+      if (self.vector_db.index is None) or (getattr(self.vector_db.index, "ntotal", 0) == 0):
+          vec_tensor = torch.zeros(B, K, D, device=self.device)
+          lbl_tensor = torch.zeros(B, K, device=self.device)
+          empty_paths = [[""] * K for _ in range(B)]
+          dist_tensor = torch.full((B, K), float("nan"), device=self.device)
+          if return_info and return_distances:
+              return vec_tensor, lbl_tensor, empty_paths, dist_tensor
+          if return_info:
+              return vec_tensor, lbl_tensor, empty_paths
+          if return_distances:
+              return vec_tensor, lbl_tensor, dist_tensor
+          return vec_tensor, lbl_tensor
 
-          train_loss = 0.0
-          train_correct = 0
-          train_total = 0
+      # Over-retrieve to allow self-exclusion without falling below K
+      k_search = K + (10 if exclude_self else 0)
+      try:
+          dists, idxs = self.vector_db.search_batch(q_np, k=k_search)  # dists/idxs: [B, k_search]
+      except Exception:
+          dists = np.zeros((B, 0), dtype=np.float32)
+          idxs  = np.zeros((B, 0), dtype=np.int64)
 
-          for idx in tqdm(range(len(train_dataset)), desc=f"Epoch {epoch+1}/{self.config.num_epochs}"):
-                item = train_dataset[idx]
-                audio_path = item['path']
-                label = item['label']
+      if idxs is None or idxs.ndim != 2 or idxs.shape[0] != B:
+          idxs = np.zeros((B, 0), dtype=np.int64)
+          dists = np.zeros((B, 0), dtype=np.float32)
 
-                # Process audio
-                tpp_vector = self.process_audio(audio_path)
+      all_vecs, all_lbls, all_paths, all_dists = [], [], [], []
 
-                # Retrieve similar vectors
-                similar_vectors, _ = self.retrieve_similar_vectors(tpp_vector)
+      for row_idx, (row_inds, row_dists) in enumerate(zip(idxs, dists)):
+          chosen_vecs, chosen_lbls, chosen_paths, chosen_dists = [], [], [], []
+          for ii, dd in zip(row_inds, row_dists):
+              ii = int(ii)
+              # Gather filename & apply self-exclusion
+              fname = os.path.basename(self.vector_db.vector_paths[ii])
+              if exclude_self:
+                  # If we know the exact query file(s), exclude only those;
+                  # otherwise fall back to training-file set as legacy behavior.
+                  if query_paths is not None:
+                      if fname in exclude_ids:
+                          continue
+                  else:
+                      if fname in getattr(self, "training_file_ids", set()):
+                          continue
 
-                # Create input tensor for projection layer
-                input_embeddings = similar_vectors.unsqueeze(0)  # [1, top_k, embedding_dim]
+              # Reconstruct vector + collect label/path/distance
+              vec = self.vector_db.index.reconstruct(ii)
+              chosen_vecs.append(vec)
+              chosen_lbls.append(self.vector_db.vector_labels[ii])
+              chosen_paths.append(self.vector_db.vector_paths[ii])
+              chosen_dists.append(float(dd))
 
-                # Forward pass through projection layer
-                projected = self.projection_layer(input_embeddings)
+              if len(chosen_vecs) == K:
+                  break
 
-                # Forward pass through detection model
-                output = self.detection_model(projected)
+          # Pad if fewer than K
+          while len(chosen_vecs) < K:
+              chosen_vecs.append(np.zeros(D, dtype=np.float32))
+              chosen_lbls.append(0.0)
+              chosen_paths.append("")
+              chosen_dists.append(float("nan"))
 
-                # Convert label to tensor
-                label_tensor = torch.tensor([label], dtype=torch.float32, device=self.config.device)
+          all_vecs.append(chosen_vecs)
+          all_lbls.append(chosen_lbls)
+          all_paths.append(chosen_paths)
+          all_dists.append(chosen_dists)
 
-                # Calculate loss
-                loss = self.criterion(output, label_tensor)
+      vec_tensor = torch.as_tensor(np.stack(all_vecs, axis=0), device=self.device, dtype=torch.float32)
+      lbl_tensor = torch.as_tensor(np.stack(all_lbls, axis=0), device=self.device, dtype=torch.float32)
+      dist_tensor = torch.as_tensor(np.stack(all_dists, axis=0), device=self.device, dtype=torch.float32)
 
-                # Backward pass and optimization
+      if return_info and return_distances:
+          return vec_tensor, lbl_tensor, all_paths, dist_tensor
+      if return_info:
+          return vec_tensor, lbl_tensor, all_paths
+      if return_distances:
+          return vec_tensor, lbl_tensor, dist_tensor
+      return vec_tensor, lbl_tensor
+
+
+
+
+    def train(self,
+              train_dataset: AudioDataset,
+              val_dataset: Optional[AudioDataset] = None):
+        """Single-GPU, mixed-precision train loop."""
+        if val_dataset:
+            self.validate_no_leakage(val_dataset)
+        if self.vector_db.index is None:
+            self.build_vector_database(train_dataset)
+
+
+        pos_weight = self.compute_pos_weight_from_dataset(train_dataset)
+        self.criterion = torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight], device=self.device, dtype=torch.float32)
+        )
+        logging.info(f"Using pos_weight={pos_weight:.3f} for BCEWithLogitsLoss")
+        loader = DataLoader(train_dataset,
+                            batch_size=self.config.train_batch_size,
+                            shuffle=True,
+                            pin_memory=True,
+                            num_workers=self.config.num_workers)
+
+        for epoch in range(self.config.num_epochs):
+            self.projection_layer.train()
+            self.detection_model.train()
+            epoch_loss, correct, total = 0., 0, 0
+
+            for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}"):
+                paths, lbls = batch['path'], batch['label']
+                tpp = self.process_audio_batch(paths, train_dataset)  # [B, dim]
+                vecs, _ = self.retrieve_similar_vectors(tpp, query_paths=paths, exclude_self=True)
+
+                # ---- Sanity checks ----
+                if torch.isnan(tpp).any():
+                    raise RuntimeError("NaNs detected in TPP embeddings")
+                if torch.isnan(vecs).any():
+                    logging.warning("NaNs in retrieved neighbor vectors; replacing with zeros.")
+                    vecs = torch.nan_to_num(vecs, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Fraction of real (non-zero) neighbors to diagnose retrieval health
+                with torch.no_grad():
+                    nnz = (vecs.abs().sum(dim=-1) > 0).float().mean().item()
+                    if nnz < 0.3:  # less than 30% of slots are real; training may stall
+                        logging.warning(f"Low real-neighbor rate: {nnz:.2f}. Consider exclude_self=False temporarily.")
+
+                with autocast("cuda"):
+                    if vecs.ndim == 1:
+                        # no retrieval neighbors? add a seq dim
+                        vecs = vecs.unsqueeze(0).unsqueeze(1)
+                    elif vecs.ndim == 2:
+                        # no retrieval neighbors? add a seq dim
+                        vecs = vecs.unsqueeze(1)
+                    batch, seq_len, feat_dim = vecs.shape
+                    assert seq_len > 0, f"Received seq_len=0, top_k={self.config.top_k}"
+                    proj = self.projection_layer(vecs)
+                    qvec = tpp                                      # [B, D_tpp]
+                    fused = torch.cat([qvec, proj], dim=1)          # [B, D_tpp + D_proj]
+                    fused = self.fuse(fused)                        # [B, D_proj]
+                    logits = self.detection_model(fused)            # [B] or [B,1]
+                    if logits.ndim == 1:
+                      logits = logits.unsqueeze(-1)
+                    labels = lbls.to(self.device).to(dtype=logits.dtype).view_as(logits)
+                    loss = self.criterion(logits, labels)
+
                 self.projection_optimizer.zero_grad()
+                self.fuse_optimizer.zero_grad()
                 self.detection_optimizer.zero_grad()
-                loss.backward()
-                self.projection_optimizer.step()
-                self.detection_optimizer.step()
+                self.scaler.scale(loss).backward()
+                # Gradient clipping for stability
+                self.scaler.unscale_(self.projection_optimizer)
+                self.scaler.unscale_(self.fuse_optimizer)
+                self.scaler.unscale_(self.detection_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.projection_layer.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.fuse.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.detection_model.parameters(), max_norm=1.0)
+                self.scaler.step(self.projection_optimizer)
+                self.scaler.step(self.fuse_optimizer)
+                self.scaler.step(self.detection_optimizer)
+                self.scaler.update()
 
-                # Update statistics
-                train_loss += loss.item()
-                train_correct += ((output > 0) == label_tensor).sum().item()
-                train_total += 1
+                epoch_loss += loss.item() * lbls.size(0)
+                preds = (logits > 0).to(labels.dtype)
+                correct += (preds == labels).sum().item()
+                total   += labels.numel()
 
-          train_loss /= train_total
-          train_accuracy = train_correct / train_total
+            train_loss = epoch_loss / total
+            train_acc  = correct / total
 
-          # Validation phase
-          if val_dataset:
-              val_loss, val_accuracy = self.evaluate(val_dataset)
-              print(f"Epoch {epoch+1}/{self.config.num_epochs}: "
-                            f"Train Loss = {train_loss:.4f}, Train Acc = {train_accuracy:.4f}, "
-                            f"Val Loss = {val_loss:.4f}, Val Acc = {val_accuracy:.4f}")
-              logging.info(f"Epoch {epoch+1}/{self.config.num_epochs}: "
-                            f"Train Loss = {train_loss:.4f}, Train Acc = {train_accuracy:.4f}, "
-                            f"Val Loss = {val_loss:.4f}, Val Acc = {val_accuracy:.4f}")
+            if val_dataset:
+                val_loss, val_acc = self.evaluate(val_dataset)
+                print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+                      f"Val Loss: {val_loss:.4f}, Val Acc:{val_acc:.4f}")
+            else:
+                print(f"Epoch {epoch+1}: Train {train_loss:.4f}/{train_acc:.4f}")
 
-              # Early stopping check
-              if val_loss < best_val_loss:
-                  best_val_loss = val_loss
-                  patience_counter = 0
+        self.save_models("final_model")
 
-                  # Save best model
-                  self.save_models("best_model")
-              else:
-                  patience_counter += 1
-                  if patience_counter >= self.config.early_stopping_patience:
-                      logging.info(f"Early stopping triggered after {epoch+1} epochs")
-                      break
-          else:
-              logging.info(f"Epoch {epoch+1}/{self.config.num_epochs}: "
-                            f"Train Loss = {train_loss:.4f}, Train Acc = {train_accuracy:.4f}")
-              print(f"Epoch {epoch+1}/{self.config.num_epochs}: "
-                            f"Train Loss = {train_loss:.4f}, Train Acc = {train_accuracy:.4f}")
 
-      # Save final model
-      self.save_models("final_model")
+    def evaluate(self, val_dataset: AudioDataset) -> Tuple[float, float]:
+        """Mixed-precision batched evaluation."""
+        loader = DataLoader(val_dataset,
+                            batch_size=self.config.eval_batch_size,
+                            shuffle=False,
+                            pin_memory=True,
+                            num_workers=self.config.num_workers)
+        self.projection_layer.eval()
+        self.detection_model.eval()
 
-    def evaluate(self, val_dataset):
-      """
-      Evaluate the model on a validation dataset.
+        total_loss, correct, total = 0., 0, 0
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Evaluating"):
+                paths, lbls = batch['path'], batch['label']
+                tpp = self.process_audio_batch(paths, val_dataset)
+                vecs, _ = self.retrieve_similar_vectors(tpp, query_paths=paths, exclude_self=True)
+                with autocast("cuda"):
+                    if vecs.ndim == 1:
+                        # no retrieval neighbors? add a seq dim
+                        vecs = vecs.unsqueeze(0).unsqueeze(1)
+                    elif vecs.ndim == 2:
+                        # no retrieval neighbors? add a seq dim
+                        vecs = vecs.unsqueeze(1)
+                    batch, seq_len, feat_dim = vecs.shape
+                    assert seq_len > 0, f"Received seq_len=0, top_k={self.config.top_k}"
+                    proj = self.projection_layer(vecs)
+                    qvec = tpp
+                    fused = torch.cat([qvec, proj], dim=1)
+                    fused = self.fuse(fused)
+                    logits = self.detection_model(fused)
+                    if logits.ndim == 1:
+                      logits = logits.unsqueeze(-1)
+                    labels = lbls.to(self.device).to(dtype=logits.dtype).view_as(logits)
+                    loss = self.criterion(logits, labels)
 
-      Args:
-          val_dataset: Validation dataset to evaluate on
+                total_loss += loss.item() * lbls.size(0)
+                preds = (logits > 0).to(labels.dtype)
+                correct += (preds == labels).sum().item()
+                total   += labels.numel()
 
-      Returns:
-          Tuple of (validation_loss, validation_accuracy)
-      """
-      # Set models to evaluation mode
-      self.projection_layer.eval()
-      self.detection_model.eval()
+        return total_loss / total, correct / total
 
-      val_loss = 0.0
-      val_correct = 0
-      val_total = 0
 
-      # For advanced metrics calculation
-      all_labels = []
-      all_scores = []
+    def _load_audio_for_inference(self, audio_path: str):
+        import librosa
+        sr = self.config.sample_rate
+        y, _ = librosa.load(audio_path, sr=sr, mono=True)
+        # pad to at least one segment
+        min_len = int(self.config.segment_length * sr)
+        if len(y) < min_len:
+            import numpy as np
+            y = np.pad(y, (0, min_len - len(y)))
+        return y
+    
+    def predict(self, audio_path: str, threshold: float = 0.5):
+        import torch, os, logging
+        if (self.vector_db.index is None) or (getattr(self.vector_db.index, "ntotal", 0) == 0):
+            logging.warning("Vector DB is empty; retrieval may be zero-padded.")
 
-      with torch.no_grad():
-          for idx in tqdm(range(len(val_dataset)), desc="Evaluating"):
-              item = val_dataset[idx]
-              audio_path = item['path']
-              label = item['label']
-
-              try:
-                  # Process audio
-                  tpp_vector = self.process_audio(audio_path)
-
-                  # Retrieve similar vectors
-                  similar_vectors, _ = self.retrieve_similar_vectors(tpp_vector)
-
-                  # Create input tensor for projection layer
-                  input_embeddings = similar_vectors.unsqueeze(0)  # [1, top_k, embedding_dim]
-
-                  # Forward pass through projection layer
-                  projected = self.projection_layer(input_embeddings)
-
-                  # Forward pass through detection model
-                  output = self.detection_model(projected)
-
-                  # Convert label to tensor
-                  label_tensor = torch.tensor([label], dtype=torch.float32, device=self.config.device)
-
-                  # Calculate loss
-                  loss = self.criterion(output, label_tensor)
-
-                  # Convert to probability with sigmoid
-                  score = torch.sigmoid(output).item()
-
-                  # Update statistics
-                  val_loss += loss.item()
-                  val_correct += ((output > 0) == label_tensor).sum().item()
-                  val_total += 1
-
-                  # Store for metrics calculation
-                  all_labels.append(label)
-                  all_scores.append(score)
-
-              except Exception as e:
-                  logging.error(f"Error evaluating sample {audio_path}: {str(e)}")
-                  # Continue with next sample rather than crashing the evaluation
-                  continue
-
-      # Calculate average loss and accuracy
-      if val_total > 0:
-          val_loss /= val_total
-          val_accuracy = val_correct / val_total
-      else:
-          logging.warning("No valid samples in validation set")
-          val_loss = float('inf')
-          val_accuracy = 0.0
-
-      return val_loss, val_accuracy
-
-    def evaluate_with_metrics(self, val_dataset):
-      """
-      Comprehensive evaluation with detailed metrics including EER.
-
-      Args:
-          val_dataset: Validation dataset to evaluate on
-
-      Returns:
-          Dictionary containing all evaluation metrics
-      """
-      # Get basic metrics first
-      val_loss, val_accuracy = self.evaluate(val_dataset)
-
-      # Rerun to collect scores for detailed metrics
-      all_labels = []
-      all_scores = []
-
-      with torch.no_grad():
-          for idx in tqdm(range(len(val_dataset)), desc="Computing metrics"):
-              item = val_dataset[idx]
-              audio_path = item['path']
-              label = item['label']
-
-              try:
-                  # Process audio
-                  tpp_vector = self.process_audio(audio_path)
-
-                  # Retrieve similar vectors
-                  similar_vectors, _ = self.retrieve_similar_vectors(tpp_vector)
-
-                  # Forward passes
-                  input_embeddings = similar_vectors.unsqueeze(0)
-                  projected = self.projection_layer(input_embeddings)
-                  output = self.detection_model(projected)
-
-                  # Get probability score
-                  score = torch.sigmoid(output).item()
-
-                  # Store for metrics calculation
-                  all_labels.append(label)
-                  all_scores.append(score)
-
-              except Exception as e:
-                  logging.warning(f"Error processing {audio_path}: {str(e)}")
-                  continue
-
-      # Calculate detailed metrics
-      metrics = {
-          'loss': val_loss,
-          'accuracy': val_accuracy,
-      }
-
-      # Compute EER and other metrics if we have enough samples
-      if len(all_labels) > 1:
-          try:
-              from sklearn.metrics import roc_curve, auc, precision_recall_curve, confusion_matrix
-
-              # Convert to numpy arrays
-              labels_np = np.array(all_labels)
-              scores_np = np.array(all_scores)
-
-              # Compute ROC curve and EER (Equal Error Rate)
-              fpr, tpr, thresholds = roc_curve(labels_np, scores_np)
-              fnr = 1 - tpr
-
-              # Find the threshold where FPR = FNR (Equal Error Rate)
-              eer_threshold = thresholds[np.nanargmin(np.absolute(fnr - fpr))]
-              eer = fpr[np.nanargmin(np.absolute(fnr - fpr))]
-
-              # Calculate t-DCF (Tandem Detection Cost Function) if specified in config
-              t_dcf = None
-              if hasattr(self.config, 'p_target'):
-                  # Using simplified t-DCF calculation
-                  p_target = getattr(self.config, 'p_target', 0.5)
-                  c_miss = getattr(self.config, 'c_miss', 1)
-                  c_fa = getattr(self.config, 'c_fa', 1)
-
-                  # Calculate normalized t-DCF
-                  dcf = p_target * c_miss * fnr + (1 - p_target) * c_fa * fpr
-                  min_dcf = np.min(dcf)
-                  t_dcf = min_dcf / min(p_target * c_miss, (1 - p_target) * c_fa)
-
-                  metrics['min_dcf'] = float(min_dcf)
-                  metrics['t_dcf'] = float(t_dcf)
-
-              # Area under ROC curve
-              roc_auc = auc(fpr, tpr)
-
-              # Store metrics
-              metrics['eer'] = float(eer)
-              metrics['eer_threshold'] = float(eer_threshold)
-              metrics['roc_auc'] = float(roc_auc)
-
-              # Compute confusion matrix at EER threshold
-              y_pred = (scores_np >= eer_threshold).astype(int)
-              cm = confusion_matrix(labels_np, y_pred)
-
-              # Format confusion matrix for easier interpretation
-              metrics['confusion_matrix'] = cm.tolist()
-
-          except (ImportError, ValueError) as e:
-              logging.warning(f"Could not compute detailed metrics: {str(e)}")
-
-      return metrics
-
-    def predict(self, audio_path: str) -> Dict:
-        """Predict whether an audio file is bonafide or spoof."""
-        # Set models to evaluation mode
         self.projection_layer.eval()
         self.detection_model.eval()
 
         with torch.no_grad():
-            # Process audio
-            tpp_vector = self.process_audio(audio_path)
+            # (A) LOAD RAW AUDIO, no AudioDataset → no meta.csv
+            wav = self._load_audio_for_inference(audio_path)
 
-            # Retrieve similar vectors
-            similar_vectors, retrieved_labels = self.retrieve_similar_vectors(tpp_vector)
+            # (B) SEGMENT → FEATURES → TPP (same path as process_audio_batch)
+            segments = self.audio_segmenter.segment_audio(wav)
+            cpu_feats = self.feature_extractor.extract_features(segments)   # list of T(C,F) cpu tensors
+            gpu_feats = [t.to(self.device) for t in cpu_feats]
+            seg_vecs  = [self.tpp.pool_features(ft) for ft in gpu_feats]    # list of [D] gpu
+            tpp_vec   = torch.mean(torch.stack(seg_vecs, dim=0), dim=0, keepdim=True)  # [1, D]
 
-            # Create input tensor for projection layer
-            input_embeddings = similar_vectors.unsqueeze(0)  # [1, top_k, embedding_dim]
+            # (C) RETRIEVE with paths + distances
+            vecs, lbls, npaths, ndists = self.retrieve_similar_vectors(
+                tpp_vec, query_paths=[audio_path], exclude_self=True,
+                return_info=True, return_distances=True
+            )
+            if torch.count_nonzero(vecs) == 0:
+                vecs, lbls, npaths, ndists = self.retrieve_similar_vectors(
+                    tpp_vec, query_paths=[audio_path], exclude_self=False,
+                    return_info=True, return_distances=True
+                )
 
-            # Forward pass through projection layer
-            projected = self.projection_layer(input_embeddings)
+            # Ensure [1, K, D]
+            if vecs.ndim == 2: vecs = vecs.unsqueeze(1)
+            elif vecs.ndim == 1: vecs = vecs.unsqueeze(0).unsqueeze(1)
 
-            # Forward pass through detection model
-            output = self.detection_model(projected)
+            # (D) FORWARD
+            from torch.amp import autocast
+            use_amp = getattr(self.config, "use_mixed_precision", False) and self.device.type == "cuda"
+            ctx = autocast("cuda") if use_amp else torch.autocast("cpu", enabled=False)
+            with ctx:
+                proj   = self.projection_layer(vecs)     # [1, D_proj]
+                fused  = torch.cat([tpp_vec, proj], dim=1)
+                fused  = self.fuse(fused)
+                logits = self.detection_model(fused)
 
-            # Convert to probability with sigmoid
-            probability = torch.sigmoid(output).item()
+            if logits.ndim == 1: logits = logits.unsqueeze(-1)
+            prob  = torch.sigmoid(logits).detach().cpu().view(-1).mean().item()
+            pred  = "spoof" if prob >= float(threshold) else "bona-fide"
+            logit = logits.detach().cpu().view(-1).mean().item()
 
-            # Make prediction
-            prediction = "bonafide" if probability >= 0.5 else "spoof"
+            # Build neighbor lists for the UI
+            if isinstance(lbls, torch.Tensor):
+                neigh_labels = [int(x) for x in lbls.squeeze(0).detach().cpu().tolist()]
+            else:
+                neigh_labels = list(lbls[0]) if isinstance(lbls, list) and len(lbls) else []
+            neigh_paths = npaths[0] if isinstance(npaths, list) and len(npaths) else []
+            if isinstance(ndists, torch.Tensor):
+                neigh_dists = [float(x) for x in ndists.squeeze(0).detach().cpu().tolist()]
+            else:
+                neigh_dists = list(ndists[0]) if isinstance(ndists, list) and len(ndists) else []
 
-        return {
-            "prediction": prediction,
-            "probability": probability,
-            "retrieved_labels": retrieved_labels.cpu().numpy(),
-        }
+            return {
+                "prediction": pred,
+                "probability": float(prob),
+                "logit": float(logit),
+                "retrieved_files": [os.path.basename(p) if p else "" for p in neigh_paths],
+                "retrieved_labels": neigh_labels,
+                "retrieved_distances": [
+                    None if (isinstance(d, float) and d != d) else d for d in neigh_dists
+                ],
+                "retrieved": [
+                    {"file": os.path.basename(p) if p else "", "path": p, "label": l, "distance": d}
+                    for p, l, d in zip(neigh_paths, neigh_labels, neigh_dists)
+                ],
+            }
+
+
+    def validate_no_leakage(self, val_dataset: AudioDataset):
+        val_ids = {os.path.basename(item['path']) for item in val_dataset}
+        overlap = self.training_file_ids & val_ids
+        if overlap:
+            raise ValueError(f"Data leakage! {len(overlap)} overlapping files.")
+        logging.info("No data leakage detected.")
+
 
     def save_models(self, prefix: str = "model"):
-        """Save the trained models."""
         models_dir = os.path.join(self.config.data_root, "models")
         os.makedirs(models_dir, exist_ok=True)
+        torch.save(self.projection_layer.state_dict(),
+                  os.path.join(models_dir, f"{prefix}_projection.pt"))
+        torch.save(self.fuse.state_dict(),
+                  os.path.join(models_dir, f"{prefix}_fuse.pt"))           # NEW
+        torch.save(self.detection_model.state_dict(),
+                  os.path.join(models_dir, f"{prefix}_detection.pt"))
+        logging.info(f"Models saved under prefix '{prefix}'.")
 
-        # Save projection layer
-        torch.save(
-            self.projection_layer.state_dict(),
-            os.path.join(models_dir, f"{prefix}_projection.pt")
-        )
-
-        # Save detection model
-        torch.save(
-            self.detection_model.state_dict(),
-            os.path.join(models_dir, f"{prefix}_detection.pt")
-        )
-
-        logging.info(f"Models saved with prefix '{prefix}'")
 
     def load_models(self, prefix: str = "best_model"):
-        """Load the trained models."""
+        import json, os, torch, logging
         models_dir = os.path.join(self.config.data_root, "models")
 
-        # Load projection layer
+        # 1) Projection
         self.projection_layer.load_state_dict(
-            torch.load(os.path.join(models_dir, f"{prefix}_projection.pt"))
-        )
+            torch.load(os.path.join(models_dir, f"{prefix}_projection.pt"),
+                    map_location=self.device))
 
-        # Load detection model
-        self.detection_model.load_state_dict(
-            torch.load(os.path.join(models_dir, f"{prefix}_detection.pt"))
-        )
+        # 2) Fuse (may not exist in old checkpoints)
+        fuse_path = os.path.join(models_dir, f"{prefix}_fuse.pt")
+        if os.path.exists(fuse_path):
+            self.fuse.load_state_dict(torch.load(fuse_path, map_location=self.device))
+        else:
+            logging.warning("Fuse weights not found; using randomly initialized fuse layer.")
 
-        logging.info(f"Models loaded with prefix '{prefix}'")
+        # 3) Detection with BN/LN-robust load
+        det_path = os.path.join(models_dir, f"{prefix}_detection.pt")
+        sd = torch.load(det_path, map_location=self.device)
+
+        def _try_load(strict: bool = True):
+            try:
+                compat = self.detection_model.load_state_dict(sd, strict=strict)
+                # PyTorch returns IncompatibleKeys with missing/unexpected fields on strict=False
+                if not strict:
+                    logging.warning(f"DetectionModel load (strict=False) -> missing={compat.missing_keys}, "
+                                    f"unexpected={compat.unexpected_keys}")
+                return True
+            except RuntimeError as e:
+                logging.warning(f"DetectionModel load failed (strict={strict}): {e}")
+                return False
+
+        # try strict with current config
+        if not _try_load(strict=True):
+            msg = "missing running_mean"  # marker for BN buffer issues
+            # If it smells like a BN mismatch, flip BN/LN and rebuild
+            self.config.use_batch_norm = False
+            self.config.use_layer_norm = True
+            # Rebuild detection head with new flags
+            fuse_out_dim = self.config.projection_output_dim
+            self.detection_model = DetectionModel(self.config, fuse_out_dim).to(self.device)
+            if not _try_load(strict=True):
+                # final fallback – accept missing buffers/keys
+                _try_load(strict=False)
+
+        logging.info(f"Models loaded from prefix '{prefix}'.")

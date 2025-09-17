@@ -1,0 +1,9 @@
+file,speaker,label
+10.wav,Bernie Sanders,spoof
+12.wav,Calvin Coolidge,bona-fide
+18.wav,Donald Trump,bona-fide
+20.wav,Donald Trump,bona-fide
+27.wav,Arnold Schwarzenegger,bona-fide
+32.wav,Ronald Reagan,spoof
+39.wav,Christopher Hitchens,bona-fide
+45.wav,Mark Zuckerberg,bona-fide

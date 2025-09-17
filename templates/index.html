@@ -1,0 +1,111 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Deepfake Audio Detection — Retrieval‑Augmented UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Deepfake Audio Detection</h1>
+    <p class="subtle">Retrieval‑Augmented • Wav2Vec2 + TPP • FAISS</p>
+  </header>
+
+  <main class="grid4">
+    <!-- Col 1: Call Log -->
+    <section class="card col1">
+      <h2>Recent Past Audio Recordings</h2>
+      <div class="toolbar">
+        <input id="searchInput" placeholder="Search speaker or file..." />
+      </div>
+      <div class="table-wrap">
+        <table id="callLog">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Speaker</th>
+              <th>Duration</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="callLogBody"></tbody>
+        </table>
+      </div>
+      <audio id="callLogPlayer" controls preload="none" style="width:100%; margin-top:8px;"></audio>
+    </section>
+
+    <!-- Col 2: Upload/Record -->
+    <section class="card col2">
+      <h2>Upload or Record</h2>
+
+      <div class="uploader">
+        <label class="btn">
+          <input type="file" id="fileInput" accept="audio/*" hidden />
+          Choose Audio File
+        </label>
+        <span id="fileName" class="muted">No file chosen</span>
+      </div>
+
+      <div class="recorder">
+        <div class="rec-buttons">
+          <button id="recStart" class="btn">● Record</button>
+          <button id="recStop" class="btn" disabled>■ Stop</button>
+          <span id="recTimer" class="muted">00:00</span>
+        </div>
+        <audio id="recPreview" controls preload="none" style="width:100%; display:none;"></audio>
+      </div>
+
+      <div class="or">— or —</div>
+
+      <div class="use-existing">
+        <button id="useSelected" class="btn-secondary">Use Selected from Call Log</button>
+        <span id="selectedInfo" class="muted">None selected</span>
+      </div>
+
+      <div class="actions">
+        <button id="predictBtn" class="btn-primary">Predict</button>
+        <span id="status" class="muted"></span>
+      </div>
+    </section>
+
+    <!-- Col 3: Retrieved Neighbors -->
+    <section class="card col3">
+      <h2>Similar Recordings</h2>
+      <div class="table-wrap">
+        <table id="neighborsTable">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Speaker</th>
+              <th>Label</th>
+              <th>Duration</th>
+              <th>Dist</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="neighborsBody"></tbody>
+        </table>
+      </div>
+      <audio id="neighborPlayer" controls preload="none" style="width:100%; margin-top:8px;"></audio>
+    </section>
+
+    <!-- Col 4: Result -->
+    <section class="card col4">
+      <h2>Result</h2>
+      <div id="resultCard" class="result-card">
+        <div id="predBadge" class="badge">—</div>
+        <div id="prob" class="prob">Probability: —</div>
+        <div id="srcMeta" class="muted">Source: —</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <small>Tip: Recording uploads .webm; for best compatibility install <code>ffmpeg</code> on the server.</small>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
