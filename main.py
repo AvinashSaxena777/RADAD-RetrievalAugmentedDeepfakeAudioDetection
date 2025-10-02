@@ -27,6 +27,11 @@ def main():
                         help="Path to audio file for prediction (required for predict mode)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Torch device for computation (e.g. cuda:0)")
+    parser.add_argument("--feature_extractor", type=str, default="wav2vec2",
+                        help="Feature extractor to use: whisper, wavlm, wav2vec2")
+    parser.add_argument("--wandb", type=bool, default=False,
+                        help="Enable or disable Weights & Biases logging")
+    
     args = parser.parse_args()
 
     # 3. Disable problematic torchaudio backends
@@ -35,18 +40,26 @@ def main():
 
     # 4. Set device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+        logging.info(f"Using GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        logging.info("Using CPU")
+    
 
     # 5. Create configuration
     config = Config()
     config.device = device
     config.data_fraction = args.data_fraction
     config.train_split = 0.8
+    config.use_wandb = args.wandb
+    config.feature_extractor_type = args.feature_extractor.lower()
+    config.model_prefix = f"_{config.feature_extractor_type}" + args.model_prefix
 
     # 6. Choose appropriate DataLoader settings
     config.num_workers = max(1, torch.cuda.device_count() * 2)
-    config.train_batch_size = getattr(config, "train_batch_size", 128)
-    config.eval_batch_size = getattr(config, "eval_batch_size", 128)
+    config.train_batch_size = getattr(config, "train_batch_size", 256)
+    config.eval_batch_size = getattr(config, "eval_batch_size", 256)
     config.db_batch_size = getattr(config, "db_batch_size", 64)
     config.top_k = getattr(config, "top_k", 5)
     config.use_batch_norm = False
@@ -56,37 +69,35 @@ def main():
     pipeline = DeepfakeDetectionPipeline(config)
 
     if args.mode == "train":
-        # 8. Instantiate datasets once with split flag
         train_dataset = AudioDataset(config, is_train=True, split_data=True)
         val_dataset   = AudioDataset(config, is_train=False, split_data=True)
-
-        # 9. Train with mixed-precision and GPU batching
+        pipeline.print_split_stats(train_dataset, "Train")
+        pipeline.print_split_stats(val_dataset,   "Val")
         pipeline.train(train_dataset, val_dataset)
 
     elif args.mode == "evaluate":
-        # 10. Load best model onto GPU
-        pipeline.load_models(args.model_prefix)
+        config.use_wandb = False
+        pipeline.load_models("final_model")
         pipeline.vector_db.load()
 
-        test_dataset = AudioDataset(config, is_train=False, split_data=False)
-        metrics = pipeline.evaluate_with_metrics(test_dataset)
-
-        print("Evaluation metrics:")
-        for key, value in metrics.items():
-            print(f"{key}: {value}")
+        test_dataset = AudioDataset(config, is_train=False, split_data=True)
+        if hasattr(pipeline, "evaluate_with_metrics"):
+            metrics = pipeline.evaluate_with_metrics(test_dataset)
+            print("Evaluation metrics:")
+            for key, value in metrics.items():
+                print(f"{key}: {value}")
+        else:
+            loss, acc = pipeline.evaluate(test_dataset)
+            print(f"Eval Loss: {loss:.4f}, Eval Acc: {acc:.4f}")
 
     elif args.mode == "predict":
         if not args.audio_path:
             raise ValueError("Audio path must be provided for predict mode")
-
-        # 11. Load model & DB on GPU
-        pipeline.load_models(args.model_prefix)
+        pipeline.load_models("best_model")
         pipeline.vector_db.load()
-
-        # 12. Single-file prediction on GPU
         result = pipeline.predict(args.audio_path)
         logging.info(f"Prediction  : {result['prediction']}")
-        logging.info(f"Probability : {result['probability']:.4f}")
+        logging.info(f"Probability(bona-fide) : {result['probability_bonafide']:.4f}")
         logging.info(f"Retrieved   : {result['retrieved_labels']}")
 
 if __name__ == "__main__":

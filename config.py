@@ -1,13 +1,28 @@
-import torch
 import os
+import torch
+import torchaudio
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from typing import List, Tuple, Dict, Optional, Union
+import logging
+import random
+import pickle
+from pathlib import Path
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, confusion_matrix, classification_report
+import faiss
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
+import librosa
+
 class Config:
     """Configuration class for the deepfake detection system."""
 
     def __init__(self):
         # Data paths
-        self.data_root = "./data"
-        self.train_data_path = "/release_in_the_wild"
-        self.test_data_path = "/release_in_the_wild"  # Same source but will be split
+        self.data_root = "/content/data"
+        self.train_data_path = "/content/release_in_the_wild/"
+        self.test_data_path = "/content/release_in_the_wild/"  # Same source but will be split
         self.vector_db_path = os.path.join(self.data_root, "vector_db")
 
         # Data loading and splitting
@@ -25,6 +40,8 @@ class Config:
 
         # Wav2Vec2 model
         self.wav2vec2_model_name = "facebook/wav2vec2-base-960h"
+        self.whisper_model_name = "openai/whisper-base"
+        self.wavlm_model_name = "microsoft/wavlm-base"
         self.wav2vec2_layers_to_use = [-4, -3, -2, -1]  # Which layers to use for feature extraction
 
         # Temporal Pyramid Pooling
@@ -70,9 +87,25 @@ class Config:
 
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.SPOOF_VALUES = {'spoof', 'fake', 'synthetic', 'spoofed', 'tts', 'vc', 'voice-conversion', 'voice conversion'}
-        self.BONA_VALUES  = {'bona-fide', 'bonafide', 'genuine', 'real', 'authentic', 'bona fide'}
 
+        self.usewandb = False
+        self.feature_extractor_type = "wav2vec2"
+
+        # 6a. Optional ASV operating-point & cost model for min t-DCF (fill for your app)
+        # self.asv_params = {
+        #     "P_miss_asv": 0.05,
+        #     "P_fa_asv": 0.01,
+        #     "P_fa_spoof_asv": 0.99,
+        #     "C_miss_asv": 1.0,
+        #     "C_fa_asv": 10.0,
+        #     "C_miss_cm": 1.0,
+        #     "C_fa_cm": 10.0,
+        #     "pi_tar": 0.01,
+        #     "pi_non": 0.99,
+        #     "pi_spoof": 0.0
+        # }
+
+        
     def update(self, **kwargs):
         """Update configuration parameters."""
         for key, value in kwargs.items():

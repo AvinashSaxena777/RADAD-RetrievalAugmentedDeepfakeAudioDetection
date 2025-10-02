@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List, Dict, Any
 from config import Config
+
 class AudioSegmenter:
     """Class for segmenting audio into fixed-length chunks with overlap."""
 

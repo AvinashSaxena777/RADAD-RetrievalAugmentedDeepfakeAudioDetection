@@ -8,10 +8,9 @@ import torchaudio
 from config import Config
 import torch
 
+# Add near the top of your file (module scope)
 class AudioDataset:
     """Dataset class with proper train/validation splitting to prevent data leakage."""
-    SPOOF_VALUES = {'spoof', 'fake', 'synthetic', 'spoofed', 'tts', 'vc', 'voice-conversion', 'voice conversion'}
-    BONA_VALUES  = {'bona-fide', 'bonafide', 'genuine', 'real', 'authentic', 'bona fide'}
 
     def __init__(self, config: Config, is_train: bool = True, split_data: bool = True):
         self.config = config
@@ -25,12 +24,18 @@ class AudioDataset:
         self.labels = []
         self.metadata = {}
 
+        # Define SPOOF and BONAFIDE values as instance attributes
+        self.SPOOF_VALUES = {'spoof', 'fake', 'synthetic', 'spoofed', 'tts', 'vc', 'voice-conversion', 'voice conversion'}
+        self.BONA_VALUES  = {'bona-fide', 'bonafide', 'genuine', 'real', 'authentic', 'bona fide'}
+
+
         # Load data with proper splitting
         self._load_data_with_split()
-        
+
 
     def _normalize_label_to_int(self, s: str) -> int:
         s = str(s).strip().lower()
+        # Corrected access to SPOOF_VALUES and BONA_VALUES
         if s in self.SPOOF_VALUES:
             return 1  # SPOOF = 1 (positive class)
         if s in self.BONA_VALUES:

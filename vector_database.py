@@ -52,16 +52,7 @@ class VectorDatabase:
           self.gpu_resources = None
           logging.warning(f"FAISS GPU init failed ({e}); falling back to CPU.")
 
-    def remap_paths(self, new_base_dir: str):
-        """Make stored paths portable: use only basenames joined to new base."""
-        import os
-        if not new_base_dir or not os.path.isdir(new_base_dir):
-            return
-        self.vector_paths = [
-            os.path.join(new_base_dir, os.path.basename(p)) for p in self.vector_paths
-        ]
 
-        
     def create_index(self, dimension: int):
       import faiss
       index_type = self.config.vector_db_index_type.upper()

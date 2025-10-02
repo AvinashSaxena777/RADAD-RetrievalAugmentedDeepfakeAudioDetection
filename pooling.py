@@ -120,4 +120,3 @@ class TemporalPyramidPooling:
         """Calculate the dimension of the TPP output."""
         # For each level, we have level * feature_dim values
         return sum(self.levels) * self.config.feature_dim
-
